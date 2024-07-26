@@ -4,6 +4,9 @@ import sys
 import json
 import doit
 
+from appdirs import user_state_dir, user_config_dir
+appname = "crzsnap"
+
 from doit import task_params, get_var
 from doit.exceptions import TaskFailed
 from doit.tools import Interactive, config_changed, CmdAction, result_dep, run_once
@@ -14,17 +17,18 @@ from copy import deepcopy
 from functools import partial
 from itertools import chain, repeat
 from dataclasses import dataclass
+from pathlib import Path
 
 
 DOIT_CONFIG = {
-    "dep_file": ".crzsnap.doit.db",
+    "dep_file": str(Path(user_state_dir("crzsnap")) / ".crzsnap.doit.db"),
     "action_string_formatting": "new",
     "verbosity": 2,
     "default_tasks": [],
     "forget_all": True
 }
 
-with open("crzsnap.json") as fp:
+with open(Path(user_config_dir("crzsnap")) / "crzsnap.json") as fp:
     ZFS_CONFIG = json.load(fp)
 
 ZFS_BOOKMARK_SAFE=ZFS_CONFIG["bookmark"]
