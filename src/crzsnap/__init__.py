@@ -20,22 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DOIT_CONFIG = {
-    "dep_file": str(Path(user_state_dir("crzsnap")) / ".crzsnap.doit.db"),
-    "action_string_formatting": "new",
-    "verbosity": 2,
-    "default_tasks": [],
-    "forget_all": True
-}
-
-with open(Path(user_config_dir("crzsnap")) / "crzsnap.json") as fp:
-    ZFS_CONFIG = json.load(fp)
-
-ZFS_BOOKMARK_SAFE=ZFS_CONFIG["bookmark"]
-ZFS_PREV_SNAPSHOTS_REQUIRED=ZFS_CONFIG["snapshot"]
-FROM_POOL=ZFS_CONFIG["from"]
-FROM_SNAP=ZFS_CONFIG["suffix"]
-TO_POOL=ZFS_CONFIG["to"]
+ZFS_BOOKMARK_SAFE=None
+ZFS_PREV_SNAPSHOTS_REQUIRED=None
+FROM_POOL=None
+FROM_SNAP=None
+TO_POOL=None
 
 FORCE_ARG = [
     {
@@ -470,8 +459,50 @@ def task_all():
     }
 
 
+opt_dataset_config = {
+    "section": "crzsnap",
+    "name": "dataset_config",
+    "long": "dataset_config",
+    "type": str,
+    "default": str(Path(user_config_dir("crzsnap")) / "crzsnap.json"),
+    "help": "location of JSON file with dataset config [default: %(default)s]",
+}
+
+
+class CrZSnapTaskLoader(ModuleTaskLoader):
+    config_file = None
+    cmd_options = (opt_dataset_config,)
+    """ModuleTaskLoader that takes an argument to change the config file
+    where datasets are loaded.
+    """
+
+    def setup(self, opt_values):
+        global ZFS_BOOKMARK_SAFE
+        global ZFS_PREV_SNAPSHOTS_REQUIRED
+        global FROM_POOL
+        global FROM_SNAP
+        global TO_POOL
+
+        with open(opt_values["dataset_config"]) as fp:
+            zfs_config = json.load(fp)
+
+        ZFS_BOOKMARK_SAFE=zfs_config["bookmark"]
+        ZFS_PREV_SNAPSHOTS_REQUIRED=zfs_config["snapshot"]
+        FROM_POOL=zfs_config["from"]
+        FROM_SNAP=zfs_config["suffix"]
+        TO_POOL=zfs_config["to"]
+
+
 def main():
-    sys.exit(DoitMain(ModuleTaskLoader(globals())).run(sys.argv[1:]))
+    sys.exit(DoitMain(CrZSnapTaskLoader(globals()), extra_config={
+        "GLOBAL": {
+            "dep_file": str(Path(user_state_dir("crzsnap")) / ".crzsnap.doit.db"),
+            "action_string_formatting": "new",
+            "verbosity": 2,
+            "default_tasks": [],
+            "forget_all": True
+        }
+    }).run(sys.argv[1:]))
 
 
 if __name__ == "__main__":
