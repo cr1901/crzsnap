@@ -21,12 +21,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ZFS_BOOKMARK_SAFE=None
-ZFS_PREV_SNAPSHOTS_REQUIRED=None
-FROM_POOL=None
-FROM_SNAP=None
-TO_POOL=None
-
 FORCE_ARG = [
     {
         "name": "force_success",
@@ -42,7 +36,7 @@ def show_cmd(task):
     if task.name == "create_snapshots":
         return "Create snapshots to send"
     elif task.name == "prepare_receiver":
-        return f"Prepare {TO_POOL} to receive datasets"
+        return f"Prepare {CONFIG.to} to receive datasets"
     elif task.name.startswith("send_snapshots"):
         # We have to reconstruct send/recv information since we can't pass
         # getargs to title :(...
@@ -50,12 +44,12 @@ def show_cmd(task):
 
         inc_src_root = task.name.split(":")[1]
         if bookmark:
-            src = f"{inc_src_root}#{FROM_SNAP}-prev"
+            src = f"{inc_src_root}#{CONFIG.suffix}-prev"
         else:
-            src = f"{inc_src_root}@{FROM_SNAP}-prev"
+            src = f"{inc_src_root}@{CONFIG.suffix}-prev"
 
-        snap = f"{inc_src_root}@{FROM_SNAP}"
-        dst = f"{inc_src_root.replace(FROM_POOL, TO_POOL, 1)}"
+        snap = f"{inc_src_root}@{CONFIG.suffix}"
+        dst = f"{inc_src_root.replace(CONFIG.from_, CONFIG.to, 1)}"
         preserved = " (with intermediate snapshots)" if not bookmark else ""
         return f"Send {src}..{snap} -> {dst}{preserved}"
     elif task.name.startswith("make_bookmarks"):
@@ -110,25 +104,25 @@ TASK_DICT_COMMON = {
 def task__zfs_list():
     yield {
         "name": "pre_create",
-        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {FROM_POOL}", save_out="snapbooks_raw")],
+        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {CONFIG.from_}", save_out="snapbooks_raw")],
         "verbosity": 0,
     }
 
     yield {
         "name": "pre_prepare",
-        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {TO_POOL}", save_out="snaps_raw")],
+        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}", save_out="snaps_raw")],
         "verbosity": 0,
     }
 
     yield {
         "name": "pre_send_from",
-        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {FROM_POOL}", save_out="from_raw")],
+        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {CONFIG.from_}", save_out="from_raw")],
         "verbosity": 0,
     }
 
     yield {
         "name": "pre_send_to",
-        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {TO_POOL}", save_out="to_raw")],
+        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}", save_out="to_raw")],
         "verbosity": 0,
     }
 
@@ -150,8 +144,8 @@ def task_check():
             snapbooks = set(snapbooks_raw.split("\n"))
             snapbooks.remove("")
 
-            books_required = set([s for s in map(lambda ds: f"{ds}#{FROM_SNAP}-prev", ZFS_BOOKMARK_SAFE)])
-            snapshots_required = set([s for s in map(lambda ds: f"{ds}@{FROM_SNAP}-prev", ZFS_PREV_SNAPSHOTS_REQUIRED)])
+            books_required = set(CONFIG.bookmark_inc_sources)
+            snapshots_required = set(CONFIG.snap_inc_sources)
 
             missing_books = books_required - snapbooks
             missing_snaps = snapshots_required - snapbooks
@@ -161,8 +155,7 @@ def task_check():
                                 f"The following snapshots/bookmarks were missing: {', '.join(missing_books.union(missing_snaps))}.\n"
                                 "Manually run with \"check:create_snapshots -f\" to skip this step when ready.")
         
-        snapshots = " ".join([s for s in map(lambda ds: f"{ds}@{FROM_SNAP}",
-                             chain(ZFS_BOOKMARK_SAFE, ZFS_PREV_SNAPSHOTS_REQUIRED))])
+        snapshots = " ".join(CONFIG.inc_targets)
 
         return {
             "snapshots": snapshots,
@@ -172,11 +165,10 @@ def task_check():
         if force_success:
             print("Assuming receiver was prepared manually")
         else:
-            candidates = [s for s in map(lambda ds: f"{ds.replace(FROM_POOL, TO_POOL, 1)}@{FROM_SNAP}",
-                          chain(ZFS_BOOKMARK_SAFE, ZFS_PREV_SNAPSHOTS_REQUIRED))]
+            candidates = [*CONFIG.dst_datasets]
 
             for rs in snaps_raw.split("\n"):
-                if rs and rs in candidates:
+                if rs and rs in CONFIG.dst_datasets:
                     candidates.remove(rs)
 
             if len(candidates) != 0:
@@ -191,21 +183,13 @@ def task_check():
         to = set(to_raw.split("\n"))
         to.remove("")
 
-        from_books_src_required = [s for s in map(lambda ds: f"{ds}#{FROM_SNAP}-prev", ZFS_BOOKMARK_SAFE)]
-        from_snaps_src_required = [s for s in map(lambda ds: f"{ds}@{FROM_SNAP}-prev", ZFS_PREV_SNAPSHOTS_REQUIRED)]
-        from_snaps_dst_required = [s for s in map(lambda ds: f"{ds}@{FROM_SNAP}",
-                                    chain(ZFS_BOOKMARK_SAFE, ZFS_PREV_SNAPSHOTS_REQUIRED))]
-        to_datasets = [s for s in map(lambda ds: f"{ds.replace(FROM_POOL, TO_POOL, 1)}",
-                                    chain(ZFS_BOOKMARK_SAFE, ZFS_PREV_SNAPSHOTS_REQUIRED))]
-        to_snaps_required = [f"{ds.replace(FROM_POOL, TO_POOL, 1)}@{FROM_SNAP}-prev" for ds in to_datasets]
-
         if force_success:
             print("Assuming snapshots are prepared manually")
         else:
-            missing_from_books_src = set(from_books_src_required) - from_
-            missing_from_snaps_src = set(from_snaps_src_required)  - from_
-            missing_from_snaps_dst = set(from_snaps_dst_required)  - from_
-            missing_to_snaps = set(to_snaps_required) - to
+            missing_from_books_src = set(CONFIG.bookmark_inc_sources) - from_
+            missing_from_snaps_src = set(CONFIG.snap_inc_sources)  - from_
+            missing_from_snaps_dst = set(CONFIG.inc_targets)  - from_
+            missing_to_snaps = set(CONFIG.dst_datasets) - to
 
             missing = missing_from_books_src | missing_from_snaps_src | \
                 missing_from_snaps_dst | missing_to_snaps
@@ -214,16 +198,15 @@ def task_check():
                                     f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
                                     "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
 
-        assert len(from_books_src_required + from_snaps_src_required) == len(from_snaps_dst_required)
-        assert len(from_snaps_dst_required) == len(to_snaps_required)
+        assert len([*chain(CONFIG.bookmark_inc_sources, CONFIG.snap_inc_sources)]) == len(CONFIG.inc_targets)
+        assert len(CONFIG.inc_targets) == len(CONFIG.dst_datasets_prev)
         send_args = dict()
         for title, from_src, from_dst, to_src, bookmark in zip(
-                                               chain(ZFS_BOOKMARK_SAFE, ZFS_PREV_SNAPSHOTS_REQUIRED),
-                                               chain(from_books_src_required, from_snaps_src_required),
-                                               from_snaps_dst_required,
-                                               to_datasets,
-                                               chain(repeat(True, len(from_books_src_required)),
-                                                     repeat(False, len(from_snaps_src_required)))):
+                                               CONFIG.all_datasets,
+                                               CONFIG.inc_sources,
+                                               CONFIG.inc_targets,
+                                               CONFIG.dst_datasets,
+                                               map(lambda ds: CONFIG.is_bookmark_safe(ds), CONFIG.all_datasets)):
             send_args[title] = dict(send_src=from_src,
                                         send_trg=from_dst,
                                         recv_src=to_src,
@@ -261,7 +244,7 @@ def task_check():
 
     # yield {
     #     "name": "pre_prepare",
-    #     "actions": [CmdAction(f"zfs list -H -rtsnap -oname {TO_POOL}", save_out="snaps_raw")],
+    #     "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}", save_out="snaps_raw")],
     #     "verbosity": 0,
     # }
 
@@ -273,23 +256,23 @@ def task_init_dataset():
        snapshots/files on receiver, and add datasets not in the config file."""
 
     def mk_create(pos):
-        return maybe_echo(f"sudo zfs snap {pos[0]}@{FROM_SNAP}")
+        return maybe_echo(f"sudo zfs snap {pos[0]}@{CONFIG.suffix}")
 
     def mk_send(pos):
-        return maybe_echo(f"sudo zfs send -pcL {pos[0]}@{FROM_SNAP} | pv -f | sudo zfs recv -F {pos[0].replace(FROM_POOL, TO_POOL, 1)}")
+        return maybe_echo(f"sudo zfs send -pcL {pos[0]}@{CONFIG.suffix} | pv -f | sudo zfs recv -F {pos[0].replace(CONFIG.from_, CONFIG.to, 1)}")
     
     def mk_rename(pos, snapshot):
         if snapshot:
-            return maybe_echo(f"sudo zfs rename {pos[0]}@{FROM_SNAP} {pos[0]}@{FROM_SNAP}-prev")
+            return maybe_echo(f"sudo zfs rename {pos[0]}@{CONFIG.suffix} {pos[0]}@{CONFIG.suffix}-prev")
         else:
-            return maybe_echo(f"sudo zfs bookmark {pos[0]}@{FROM_SNAP} {pos[0]}#{FROM_SNAP}-prev")
+            return maybe_echo(f"sudo zfs bookmark {pos[0]}@{CONFIG.suffix} {pos[0]}#{CONFIG.suffix}-prev")
 
 
     def mk_maybe_destroy(pos, snapshot):
         if snapshot:
             return ""
         else:
-            return maybe_echo(f"sudo zfs destroy {pos[0]}@{FROM_SNAP}")
+            return maybe_echo(f"sudo zfs destroy {pos[0]}@{CONFIG.suffix}")
 
     return {
         "actions": [
@@ -332,10 +315,10 @@ def task_create_snapshots():
 
 def task_prepare_receiver():
     def mk_destroy(force_success):
-        return maybe_echo_or_force(f"sudo zfs destroy -r {TO_POOL}@{FROM_SNAP}-prev", force_success)
+        return maybe_echo_or_force(f"sudo zfs destroy -r {CONFIG.to}@{CONFIG.suffix}-prev", force_success)
 
     def mk_rename(force_success):
-        return maybe_echo_or_force(f"sudo zfs rename -r {TO_POOL}@{FROM_SNAP} {TO_POOL}@{FROM_SNAP}-prev", force_success)
+        return maybe_echo_or_force(f"sudo zfs rename -r {CONFIG.to}@{CONFIG.suffix} {CONFIG.to}@{CONFIG.suffix}-prev", force_success)
 
     return {
         "actions": [
@@ -358,9 +341,8 @@ def task_send_snapshots():
     # seems to fail with "cannot receive: failed to read from stream" if
     # the snapshot pipe@from-raidz exists already. Don't bother complicating
     # the commands just for that.
-    for key, bookmark_safe in zip(chain(ZFS_BOOKMARK_SAFE, ZFS_PREV_SNAPSHOTS_REQUIRED),
-                                    chain(repeat(True, len(ZFS_BOOKMARK_SAFE)),
-                                          repeat(False, len(ZFS_PREV_SNAPSHOTS_REQUIRED)))):
+    for key, bookmark_safe in  zip(CONFIG.all_datasets,
+                                   map(lambda ds: CONFIG.is_bookmark_safe(ds), CONFIG.all_datasets)):
         def mk_send(force_success, send_info):
             send_src = send_info["send_src"]
             send_trg = send_info["send_trg"]
@@ -407,9 +389,7 @@ def task_rotate_sender():
     pass
 
 def task_make_bookmarks():
-    bookmarks = [s for s in map(lambda ds: f"{ds}#{FROM_SNAP}-prev", ZFS_BOOKMARK_SAFE)]
-    book_snap = [s for s in map(lambda ds: f"{ds}@{FROM_SNAP}", ZFS_BOOKMARK_SAFE)]
-    for b, bs in zip(bookmarks, book_snap):
+    for b, bs in zip(CONFIG.bookmark_inc_sources, CONFIG.bookmark_inc_targets):
         yield {
             "name": b.replace("/", "-"),
             "actions": [
@@ -427,9 +407,7 @@ def task_make_bookmarks():
 
 
 def task_move_snapshots():
-    prev_snaps = [s for s in map(lambda ds: f"{ds}@{FROM_SNAP}-prev", ZFS_PREV_SNAPSHOTS_REQUIRED)]
-    snaps = [s for s in map(lambda ds: f"{ds}@{FROM_SNAP}", ZFS_PREV_SNAPSHOTS_REQUIRED)]
-    for p, s in zip(prev_snaps, snaps):
+    for p, s in zip(CONFIG.snap_inc_sources, CONFIG.snap_inc_targets):
         yield {
             "name": p.replace("/", "-"),
             "actions": [
@@ -460,28 +438,76 @@ def task_all():
     }
 
 
-# Custom guard against super/subclasses modifying global data more than once.
-class ConfigSingleton(Config):
-    def __init__(self, entries):
-        self.entries = entries
-        self.set_already = False
+class ZFSConfig(Config):
+    # Basic getters
+    @property
+    def to(self):
+        return self["to"]
+    
+    @property
+    def from_(self):
+        return self["from"]
+    
+    @property
+    def suffix(self):
+        return self["suffix"]
 
-    def __get__(self, obj, objtype=None):
-        return self.entries
+    @property
+    def bookmark_safe_datasets(self):
+        return self["bookmark"]
 
-    def __set__(self, obj, value):
-        if self.set_already:
-            raise ValueError("attempt to set config twice")
-        elif not isinstance(value, dict):
-            raise ValueError(f"attempt to set config with non-dict object {type(value)}")
-        else:
-            self.entries.update(value)
-            self.set_already = True
+    @property
+    def snap_req_datasets(self):
+        return self["snapshot"]
+
+    # Useful derived getters
+    @property
+    def all_datasets(self):
+        return chain(self.bookmark_safe_datasets, self.snap_req_datasets)
+
+    def is_bookmark_safe(self, ds):
+        return ds in self.bookmark_safe_datasets
+
+    @property
+    def bookmark_inc_sources(self):
+        return map(lambda ds: f"{ds}#{self.from_}-prev", self.bookmark_safe_datasets)
+
+    @property
+    def bookmark_inc_targets(self):
+        return map(lambda ds: f"{ds}@{self.from_}", self.bookmark_safe_datasets)
+
+    @property
+    def snap_inc_sources(self):
+        return map(lambda ds: f"{ds}@{self.from_}-prev", self.snap_req_datasets)
+    
+    @property
+    def snap_inc_targets(self):
+        return map(lambda ds: f"{ds}@{self.from_}", self.snap_req_datasets)
+    
+    @property
+    def inc_sources(self):
+        return chain(self.bookmark_inc_sources, self.snap_inc_sources)
+
+    @property
+    def inc_targets(self):
+        return chain(self.bookmark_inc_targets, self.snap_inc_targets)
+    
+    @property
+    def dst_datasets(self):
+        # FIXME: make sure the string begins with self.from_ before
+        # substituting.
+        return map(lambda ds: f"{ds.replace(self.from_, self.to, 1)}@{CONFIG.suffix}", self.all_datasets)
+
+    @property
+    def dst_datasets_prev(self):
+        # FIXME: make sure the string begins with self.from_ before
+        # substituting.
+        return map(lambda ds: f"{ds.replace(self.from_, self.to, 1)}@{CONFIG.suffix}-prev", self.all_datasets)
 
 
 # The Config is injected into all task creator classes as an empty config.
 # Then the task loader populates each entry.
-CONFIG = Config({
+CONFIG = ZFSConfig({
     "from": "",
     "to": "",
     "suffix": "",
@@ -509,32 +535,19 @@ class CrZSnapTaskLoader(ModuleTaskLoader):
     where datasets are loaded.
     """
 
-    zfs_config = ConfigSingleton(CONFIG)
-
-    def __init__(self, mod_dict):
+    def __init__(self, mod_dict, zfs_config):
+        self.zfs_config = zfs_config
         super().__init__(mod_dict)
 
     def setup(self, opt_values):
-        global ZFS_BOOKMARK_SAFE
-        global ZFS_PREV_SNAPSHOTS_REQUIRED
-        global FROM_POOL
-        global FROM_SNAP
-        global TO_POOL
-
         with open(opt_values["dataset_config"]) as fp:
             zfs_config = json.load(fp)
 
-        self.zfs_config = zfs_config
-
-        ZFS_BOOKMARK_SAFE=zfs_config["bookmark"]
-        ZFS_PREV_SNAPSHOTS_REQUIRED=zfs_config["snapshot"]
-        FROM_POOL=zfs_config["from"]
-        FROM_SNAP=zfs_config["suffix"]
-        TO_POOL=zfs_config["to"]
+        self.zfs_config.update(zfs_config)
 
 
 def main():
-    sys.exit(DoitMain(CrZSnapTaskLoader(globals()), extra_config={
+    sys.exit(DoitMain(CrZSnapTaskLoader(globals(), CONFIG), extra_config={
         "GLOBAL": {
             "dep_file": str(Path(user_state_dir("crzsnap")) / ".crzsnap.doit.db"),
             "action_string_formatting": "new",
