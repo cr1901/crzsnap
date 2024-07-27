@@ -5,6 +5,7 @@ import json
 import doit
 
 from appdirs import user_state_dir, user_config_dir
+from configclass import Config
 appname = "crzsnap"
 
 from doit import task_params, get_var
@@ -459,6 +460,39 @@ def task_all():
     }
 
 
+# Custom guard against super/subclasses modifying global data more than once.
+class ConfigSingleton(Config):
+    def __init__(self, entries):
+        self.entries = entries
+        self.set_already = False
+
+    def __get__(self, obj, objtype=None):
+        return self.entries
+
+    def __set__(self, obj, value):
+        if self.set_already:
+            raise ValueError("attempt to set config twice")
+        elif not isinstance(value, dict):
+            raise ValueError(f"attempt to set config with non-dict object {type(value)}")
+        else:
+            self.entries.update(value)
+            self.set_already = True
+
+
+# The Config is injected into all task creator classes as an empty config.
+# Then the task loader populates each entry.
+CONFIG = Config({
+    "from": "",
+    "to": "",
+    "suffix": "",
+    "bookmark": [
+    ],
+    "snapshot": [
+    ]
+})
+
+
+# Add a CLI parameter to our loader.
 opt_dataset_config = {
     "section": "crzsnap",
     "name": "dataset_config",
@@ -470,11 +504,15 @@ opt_dataset_config = {
 
 
 class CrZSnapTaskLoader(ModuleTaskLoader):
-    config_file = None
     cmd_options = (opt_dataset_config,)
     """ModuleTaskLoader that takes an argument to change the config file
     where datasets are loaded.
     """
+
+    zfs_config = ConfigSingleton(CONFIG)
+
+    def __init__(self, mod_dict):
+        super().__init__(mod_dict)
 
     def setup(self, opt_values):
         global ZFS_BOOKMARK_SAFE
@@ -485,6 +523,8 @@ class CrZSnapTaskLoader(ModuleTaskLoader):
 
         with open(opt_values["dataset_config"]) as fp:
             zfs_config = json.load(fp)
+
+        self.zfs_config = zfs_config
 
         ZFS_BOOKMARK_SAFE=zfs_config["bookmark"]
         ZFS_PREV_SNAPSHOTS_REQUIRED=zfs_config["snapshot"]
