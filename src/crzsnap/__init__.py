@@ -40,18 +40,14 @@ def show_cmd(task):
     elif task.name.startswith("send_snapshots"):
         # We have to reconstruct send/recv information since we can't pass
         # getargs to title :(...
-        bookmark = not task.meta["intr"]
+        dataset = task.name.split(":")[1]
+        inc_src = CONFIG.inc_src(dataset)
+        bookmark = CONFIG.is_bookmark_safe(dataset)
+        inc_trg = CONFIG.inc_trg(dataset)
+        dst_trg = CONFIG.dst_trg(dataset)
 
-        inc_src_root = task.name.split(":")[1]
-        if bookmark:
-            src = f"{inc_src_root}#{CONFIG.suffix}-prev"
-        else:
-            src = f"{inc_src_root}@{CONFIG.suffix}-prev"
-
-        snap = f"{inc_src_root}@{CONFIG.suffix}"
-        dst = f"{inc_src_root.replace(CONFIG.from_, CONFIG.to, 1)}"
         preserved = " (with intermediate snapshots)" if not bookmark else ""
-        return f"Send {src}..{snap} -> {dst}{preserved}"
+        return f"Send {inc_src}..{inc_trg} -> {dst_trg}{preserved}"
     elif task.name.startswith("make_bookmarks"):
         book = task.meta["book"]
         snap = task.meta["snap"]
@@ -162,8 +158,8 @@ def task_check():
         snapbooks = set(snapbooks_raw.split("\n"))
         snapbooks.remove("")
 
-        books_required = set(CONFIG.bookmark_inc_sources)
-        snapshots_required = set(CONFIG.snap_inc_sources)
+        books_required = set(CONFIG.bookmark_inc_sources())
+        snapshots_required = set(CONFIG.snap_inc_sources())
 
         missing_books = books_required - snapbooks
         missing_snaps = snapshots_required - snapbooks
@@ -173,14 +169,15 @@ def task_check():
                             f"The following snapshots/bookmarks were missing: {', '.join(missing_books.union(missing_snaps))}.\n"
                             "Manually run with \"check:create_snapshots -f\" to skip this step when ready.")
 
+    # Calculate w/ getargs b/c it's convenient.
     def create_success():
-        snapshots = " ".join(CONFIG.inc_targets)
+        snapshots = " ".join(CONFIG.inc_targets())
         return {
             "snapshots": snapshots,
         }
 
     def prepare_precond(snaps_raw):
-        candidates = set(CONFIG.dst_datasets)
+        candidates = set(CONFIG.dst_datasets())
         all_snaps = set(snaps_raw.split("\n"))
 
         if len(candidates - all_snaps) != 0:
@@ -195,10 +192,14 @@ def task_check():
         to = set(to_raw.split("\n"))
         to.remove("")
 
-        missing_from_books_src = set(CONFIG.bookmark_inc_sources) - from_
-        missing_from_snaps_src = set(CONFIG.snap_inc_sources)  - from_
-        missing_from_snaps_dst = set(CONFIG.inc_targets)  - from_
-        missing_to_snaps = set(CONFIG.dst_datasets_prev) - to
+        missing_from_books_src = set(CONFIG.bookmark_inc_sources()) - from_
+        missing_from_snaps_src = set(CONFIG.snap_inc_sources())  - from_
+        missing_from_snaps_dst = set(CONFIG.inc_targets())  - from_
+        missing_to_snaps = set(CONFIG.dst_datasets_prev()) - to
+
+        assert len([*CONFIG.all_datasets()]) == len([*CONFIG.inc_sources()])
+        assert len([*CONFIG.inc_sources()]) == len([*CONFIG.inc_targets()])
+        assert len([*CONFIG.inc_targets()]) == len([*CONFIG.dst_datasets()])
 
         missing = missing_from_books_src | missing_from_snaps_src | \
             missing_from_snaps_dst | missing_to_snaps
@@ -206,25 +207,6 @@ def task_check():
                 return TaskFailed("Sender/Receiver snapshots/bookmarks don't match expected.\n"
                                 f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
                                 "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
-
-    def send_success():
-        assert len([*CONFIG.all_datasets]) == len([*CONFIG.inc_sources])
-        assert len([*CONFIG.inc_sources]) == len([*CONFIG.inc_targets])
-        assert len([*CONFIG.inc_targets]) == len([*CONFIG.dst_datasets])
-
-        send_args = dict()
-        inc_sources = [*CONFIG.inc_sources]
-        inc_targets = [*CONFIG.inc_targets]
-        dst_datasets = [*CONFIG.dst_datasets]
-
-        for i, ds in enumerate(CONFIG.all_datasets):
-            title = ds
-            keys = ["send_src", "send_trg", "recv_trg", "bookmark"]
-            vals = [inc_sources[i], inc_targets[i], dst_datasets[i],
-                    CONFIG.is_bookmark_safe(ds)]
-            send_args[title] = dict(zip(keys, vals))
-
-        return send_args
 
     yield {
         "name": "create_snapshots",
@@ -248,7 +230,7 @@ def task_check():
 
     yield {
         "name": "send_snapshots",
-        "actions": [check_func(send_precond, send_success,
+        "actions": [check_func(send_precond, lambda: None,
                                "Assuming snapshots are prepared manually")],
         "getargs": {
             "from_raw": ("_zfs_list:pre_send_from", "from_raw"),
@@ -267,7 +249,8 @@ def task_init_dataset():
     """Initialize a dataset on sender and receiver for future incremental backups.
        
        Unlike other commands, this command is potentially destructive, and does
-       not perform checks against the config file. Thus, it can destroy existing
+       not perform checks against the config file (other than grabbing the
+       snapshot suffix and source/dest pool names). Thus, it can destroy existing
        snapshots/files on receiver, and add datasets not in the config file."""
 
     @maybe_echo
@@ -362,17 +345,15 @@ def task_send_snapshots():
     # seems to fail with "cannot receive: failed to read from stream" if
     # the snapshot pipe@from-raidz exists already. Don't bother complicating
     # the commands just for that.
-    for key in CONFIG.all_datasets:
+    for key in CONFIG.all_datasets():
         @maybe_echo_or_force
-        def mk_send(send_info):
-            send_src = send_info["send_src"]
-            send_trg = send_info["send_trg"]
-            recv_trg = send_info["recv_trg"]
-
-            if send_info["bookmark"]:
-                return f"sudo zfs send -pcLi {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_trg}"
-            else:
-                return f"sudo zfs send -pcLRI {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_trg}"
+        def mk_send(key=key):
+            send_src = CONFIG.inc_src(key)
+            send_trg = CONFIG.inc_trg(key)
+            recv_trg = CONFIG.dst_trg(key)
+            flags = "-pcLi" if CONFIG.is_bookmark_safe(key) else "-pcLRI"
+            
+            return f"sudo zfs send {flags} {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_trg}"
 
         yield {
             "name": key,
@@ -380,15 +361,12 @@ def task_send_snapshots():
                 # buffering=1 so pv works
                 CmdAction(mk_send, buffering=1)
             ],
-            "getargs": {
-                "send_info": ("check:send_snapshots", key),
-            },
+            "setup": [
+                "check:send_snapshots"
+            ],
             "task_dep": [
                 "prepare_receiver"
             ],
-            "meta": {
-                "intr": not CONFIG.is_bookmark_safe(key)
-            },
             **deepcopy(TASK_DICT_COMMON),
         }
 
@@ -410,7 +388,7 @@ def task_rotate_sender():
     pass
 
 def task_make_bookmarks():
-    for b, bs in zip(CONFIG.bookmark_inc_sources, CONFIG.bookmark_inc_targets):
+    for b, bs in zip(CONFIG.bookmark_inc_sources(), CONFIG.bookmark_inc_targets()):
         yield {
             "name": b.replace("/", "-"),
             "actions": [
@@ -428,7 +406,7 @@ def task_make_bookmarks():
 
 
 def task_move_snapshots():
-    for p, s in zip(CONFIG.snap_inc_sources, CONFIG.snap_inc_targets):
+    for p, s in zip(CONFIG.snap_inc_sources(), CONFIG.snap_inc_targets()):
         yield {
             "name": p.replace("/", "-"),
             "actions": [
@@ -460,7 +438,7 @@ def task_all():
 
 
 class ZFSConfig(Config):
-    # Basic getters
+    # Basic getters- plays nicer with f-strings.
     @property
     def to(self):
         return self["to"]
@@ -481,49 +459,52 @@ class ZFSConfig(Config):
     def snap_req_datasets(self):
         return self["snapshot"]
 
-    # Useful derived getters
-    @property
     def all_datasets(self):
         return chain(self.bookmark_safe_datasets, self.snap_req_datasets)
+
+    def inc_src(self, ds):
+        splitter = "#" if self.is_bookmark_safe(ds) else "@"
+        return f"{ds}{splitter}{self.suffix}-prev" 
+    
+    def inc_trg(self, ds):
+        return f"{ds}@{self.suffix}"
+    
+    def dst_trg(self, ds):
+        return f"{ds.replace(self.from_, self.to, 1)}@{self.suffix}"
+
+    def dst_trg_prev(self, ds):
+        return f"{ds.replace(self.from_, self.to, 1)}@{CONFIG.suffix}-prev"
 
     def is_bookmark_safe(self, ds):
         return ds in self.bookmark_safe_datasets
 
-    @property
     def bookmark_inc_sources(self):
-        return map(lambda ds: f"{ds}#{self.suffix}-prev", self.bookmark_safe_datasets)
+        return map(self.inc_src, self.bookmark_safe_datasets)
 
-    @property
     def bookmark_inc_targets(self):
-        return map(lambda ds: f"{ds}@{self.suffix}", self.bookmark_safe_datasets)
+        return map(self.inc_trg, self.bookmark_safe_datasets)
 
-    @property
     def snap_inc_sources(self):
-        return map(lambda ds: f"{ds}@{self.suffix}-prev", self.snap_req_datasets)
-    
-    @property
-    def snap_inc_targets(self):
-        return map(lambda ds: f"{ds}@{self.suffix}", self.snap_req_datasets)
-    
-    @property
-    def inc_sources(self):
-        return chain(self.bookmark_inc_sources, self.snap_inc_sources)
+        return map(self.inc_src, self.snap_req_datasets)
 
-    @property
+    def snap_inc_targets(self):
+        return map(self.inc_trg, self.snap_req_datasets)
+
+    def inc_sources(self):
+        return map(self.inc_src, self.all_datasets())
+
     def inc_targets(self):
-        return chain(self.bookmark_inc_targets, self.snap_inc_targets)
-    
-    @property
+        return map(self.inc_trg, self.all_datasets())
+
     def dst_datasets(self):
         # FIXME: make sure the string begins with self.from_ before
         # substituting.
-        return map(lambda ds: f"{ds.replace(self.from_, self.to, 1)}@{CONFIG.suffix}", self.all_datasets)
+        return map(self.dst_trg, self.all_datasets())
 
-    @property
     def dst_datasets_prev(self):
         # FIXME: make sure the string begins with self.from_ before
         # substituting.
-        return map(lambda ds: f"{ds.replace(self.from_, self.to, 1)}@{CONFIG.suffix}-prev", self.all_datasets)
+        return map(self.dst_trg_prev, self.all_datasets())
 
 
 # The Config is injected into all task creator classes as an empty config.
