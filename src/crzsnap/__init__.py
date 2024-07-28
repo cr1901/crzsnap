@@ -62,22 +62,30 @@ def show_cmd(task):
         return f"Replace {snap} -> {prev}"
     elif task.name.startswith("check"):
         return f"Checking preconditions for {task.name.split(':')[1]}"
+    elif task.name.startswith("init"):
+        return "Initialize dataset for use with this script"
     else:
         return f"??? ({task.name})"
 
 
-def maybe_echo_or_force(cmd, force_success):
-    echo = bool(get_var("echo", False))
-    if force_success and not echo:
-        return ""
-    elif echo:
-        return f"echo \"{cmd}\""
-    else:
-        return cmd
+def maybe_echo_or_force(cmd):
+    def inner(*args, force_success, **kwargs):
+        echo = bool(get_var("echo", False))
+        if force_success and not echo:
+            return ""
+        elif echo:
+            return f"echo \"{cmd(*args, **kwargs)}\""
+        else:
+            return cmd(*args, **kwargs)
+        
+    return inner
 
 
 def maybe_echo(cmd):
-    return maybe_echo_or_force(cmd, False)
+    def inner(*args, **kwargs):
+        return maybe_echo_or_force(cmd)(*args, force_success=False, **kwargs)
+
+    return inner
 
 
 def run_once_unless_echo_invoked(task, values):
@@ -128,14 +136,13 @@ def task__zfs_list():
 
 
 def task_check():
-    def task_dict_common():
-        return {
-            "title": show_cmd,
-            "params": FORCE_ARG,
-            "uptodate": [
-                run_once
-            ],
-        }
+    task_dict_common = {
+        "title": show_cmd,
+        "params": FORCE_ARG,
+        "uptodate": [
+            run_once
+        ],
+    }
 
     def create_precond(force_success, snapbooks_raw):
         if force_success:
@@ -165,15 +172,12 @@ def task_check():
         if force_success:
             print("Assuming receiver was prepared manually")
         else:
-            candidates = [*CONFIG.dst_datasets]
+            candidates = set(CONFIG.dst_datasets)
+            all_snaps = set(snaps_raw.split("\n"))
 
-            for rs in snaps_raw.split("\n"):
-                if rs and rs in CONFIG.dst_datasets:
-                    candidates.remove(rs)
-
-            if len(candidates) != 0:
+            if len(candidates - all_snaps) != 0:
                 return TaskFailed("Receiver snapshots don't match expected.\n"
-                                f"The following snapshots were missing: {', '.join(candidates)}.\n"
+                                f"The following snapshots were missing: {', '.join(candidates - all_snaps)}.\n"
                                 "Manually run with \"check:prepare_receiver -f\" to skip this step when ready.")
             
     def send_precond(force_success, from_raw, to_raw):
@@ -189,7 +193,7 @@ def task_check():
             missing_from_books_src = set(CONFIG.bookmark_inc_sources) - from_
             missing_from_snaps_src = set(CONFIG.snap_inc_sources)  - from_
             missing_from_snaps_dst = set(CONFIG.inc_targets)  - from_
-            missing_to_snaps = set(CONFIG.dst_datasets) - to
+            missing_to_snaps = set(CONFIG.dst_datasets_prev) - to
 
             missing = missing_from_books_src | missing_from_snaps_src | \
                 missing_from_snaps_dst | missing_to_snaps
@@ -198,19 +202,21 @@ def task_check():
                                     f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
                                     "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
 
-        assert len([*chain(CONFIG.bookmark_inc_sources, CONFIG.snap_inc_sources)]) == len([*CONFIG.inc_targets])
-        assert len([*CONFIG.inc_targets]) == len([*CONFIG.dst_datasets_prev])
+        assert len([*CONFIG.all_datasets]) == len([*CONFIG.inc_sources])
+        assert len([*CONFIG.inc_sources]) == len([*CONFIG.inc_targets])
+        assert len([*CONFIG.inc_targets]) == len([*CONFIG.dst_datasets])
+
         send_args = dict()
-        for title, from_src, from_dst, to_src, bookmark in zip(
-                                               CONFIG.all_datasets,
-                                               CONFIG.inc_sources,
-                                               CONFIG.inc_targets,
-                                               CONFIG.dst_datasets,
-                                               map(lambda ds: CONFIG.is_bookmark_safe(ds), CONFIG.all_datasets)):
-            send_args[title] = dict(send_src=from_src,
-                                        send_trg=from_dst,
-                                        recv_src=to_src,
-                                        bookmark=bookmark)
+        inc_sources = [*CONFIG.inc_sources]
+        inc_targets = [*CONFIG.inc_targets]
+        dst_datasets = [*CONFIG.dst_datasets]
+
+        for i, ds in enumerate(CONFIG.all_datasets):
+            title = ds
+            keys = ["send_src", "send_trg", "recv_trg", "bookmark"]
+            vals = [inc_sources[i], inc_targets[i], dst_datasets[i],
+                    CONFIG.is_bookmark_safe(ds)]
+            send_args[title] = dict(zip(keys, vals))
             
         return send_args
 
@@ -220,7 +226,7 @@ def task_check():
         "getargs": {
             "snapbooks_raw": ("_zfs_list:pre_create", "snapbooks_raw")
         },
-        **task_dict_common()
+        **deepcopy(task_dict_common)
     }
 
     yield {
@@ -229,7 +235,7 @@ def task_check():
         "getargs": {
             "snaps_raw": ("_zfs_list:pre_prepare", "snaps_raw")
         },
-        **task_dict_common()
+        **deepcopy(task_dict_common)
     }
 
     yield {
@@ -239,7 +245,7 @@ def task_check():
             "from_raw": ("_zfs_list:pre_send_from", "from_raw"),
             "to_raw": ("_zfs_list:pre_send_to", "to_raw"),
         },
-        **task_dict_common()
+        **deepcopy(task_dict_common)
     }
 
     # yield {
@@ -255,24 +261,27 @@ def task_init_dataset():
        not perform checks against the config file. Thus, it can destroy existing
        snapshots/files on receiver, and add datasets not in the config file."""
 
-    def mk_create(pos):
-        return maybe_echo(f"sudo zfs snap {pos[0]}@{CONFIG.suffix}")
+    @maybe_echo
+    def mk_create(pos, snapshot):
+        return f"sudo zfs snap {pos[0]}@{CONFIG.suffix}"
 
-    def mk_send(pos):
-        return maybe_echo(f"sudo zfs send -pcL {pos[0]}@{CONFIG.suffix} | pv -f | sudo zfs recv -F {pos[0].replace(CONFIG.from_, CONFIG.to, 1)}")
-    
+    @maybe_echo
+    def mk_send(pos, snapshot):
+        return f"sudo zfs send -pcL {pos[0]}@{CONFIG.suffix} | pv -f | sudo zfs recv -F {pos[0].replace(CONFIG.from_, CONFIG.to, 1)}"
+
+    @maybe_echo    
     def mk_rename(pos, snapshot):
         if snapshot:
-            return maybe_echo(f"sudo zfs rename {pos[0]}@{CONFIG.suffix} {pos[0]}@{CONFIG.suffix}-prev")
+            return f"sudo zfs rename {pos[0]}@{CONFIG.suffix} {pos[0]}@{CONFIG.suffix}-prev"
         else:
-            return maybe_echo(f"sudo zfs bookmark {pos[0]}@{CONFIG.suffix} {pos[0]}#{CONFIG.suffix}-prev")
+            return f"sudo zfs bookmark {pos[0]}@{CONFIG.suffix} {pos[0]}#{CONFIG.suffix}-prev"
 
-
+    @maybe_echo
     def mk_maybe_destroy(pos, snapshot):
         if snapshot:
             return ""
         else:
-            return maybe_echo(f"sudo zfs destroy {pos[0]}@{CONFIG.suffix}")
+            return f"sudo zfs destroy {pos[0]}@{CONFIG.suffix}"
 
     return {
         "actions": [
@@ -296,9 +305,10 @@ def task_init_dataset():
     
 
 def task_create_snapshots():
-    def mk_cmd(snapshots, force_success):
+    @maybe_echo_or_force
+    def mk_cmd(snapshots):
         # Will fail if snapshots already exist 
-        return maybe_echo_or_force(f"sudo zfs snap {snapshots}", force_success)
+        return f"sudo zfs snap {snapshots}"
 
     return {
         "actions": [
@@ -314,11 +324,13 @@ def task_create_snapshots():
 
 
 def task_prepare_receiver():
-    def mk_destroy(force_success):
-        return maybe_echo_or_force(f"sudo zfs destroy -r {CONFIG.to}@{CONFIG.suffix}-prev", force_success)
+    @maybe_echo_or_force
+    def mk_destroy():
+        return f"sudo zfs destroy -r {CONFIG.to}@{CONFIG.suffix}-prev"
 
-    def mk_rename(force_success):
-        return maybe_echo_or_force(f"sudo zfs rename -r {CONFIG.to}@{CONFIG.suffix} {CONFIG.to}@{CONFIG.suffix}-prev", force_success)
+    @maybe_echo_or_force
+    def mk_rename():
+        return f"sudo zfs rename -r {CONFIG.to}@{CONFIG.suffix} {CONFIG.to}@{CONFIG.suffix}-prev"
 
     return {
         "actions": [
@@ -343,15 +355,16 @@ def task_send_snapshots():
     # the commands just for that.
     for key, bookmark_safe in  zip(CONFIG.all_datasets,
                                    map(lambda ds: CONFIG.is_bookmark_safe(ds), CONFIG.all_datasets)):
-        def mk_send(force_success, send_info):
+        @maybe_echo_or_force
+        def mk_send(send_info):
             send_src = send_info["send_src"]
             send_trg = send_info["send_trg"]
-            recv_src = send_info["recv_src"]
+            recv_trg = send_info["recv_trg"]
 
             if send_info["bookmark"]:
-                return maybe_echo_or_force(f"sudo zfs send -pcLi {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_src}", force_success)
+                return f"sudo zfs send -pcLi {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_trg}"
             else:
-                return maybe_echo_or_force(f"sudo zfs send -pcLRI {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_src}", force_success) 
+                return f"sudo zfs send -pcLRI {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_trg}"
 
         yield {
             "name": key,
