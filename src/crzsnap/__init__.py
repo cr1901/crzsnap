@@ -136,6 +136,20 @@ def task__zfs_list():
 
 
 def task_check():
+    def check_func(check_phase, success_phase, force_msg):
+        def inner(*args, force_success, **kwargs):
+            if force_success:
+                print(force_msg)
+                return success_phase()
+            else:
+                ret = check_phase(*args, **kwargs)
+                if isinstance(ret, TaskFailed):
+                    return ret
+                else:
+                    return success_phase()
+        
+        return inner
+
     task_dict_common = {
         "title": show_cmd,
         "params": FORCE_ARG,
@@ -144,64 +158,56 @@ def task_check():
         ],
     }
 
-    def create_precond(force_success, snapbooks_raw):
-        if force_success:
-            print("Assuming sender was prepared manually")
-        else:
-            snapbooks = set(snapbooks_raw.split("\n"))
-            snapbooks.remove("")
+    def create_precond(snapbooks_raw):
+        snapbooks = set(snapbooks_raw.split("\n"))
+        snapbooks.remove("")
 
-            books_required = set(CONFIG.bookmark_inc_sources)
-            snapshots_required = set(CONFIG.snap_inc_sources)
+        books_required = set(CONFIG.bookmark_inc_sources)
+        snapshots_required = set(CONFIG.snap_inc_sources)
 
-            missing_books = books_required - snapbooks
-            missing_snaps = snapshots_required - snapbooks
+        missing_books = books_required - snapbooks
+        missing_snaps = snapshots_required - snapbooks
 
-            if missing_books or missing_snaps:
-                return TaskFailed("Sender snapshots/bookmarks don't match expected.\n"
-                                f"The following snapshots/bookmarks were missing: {', '.join(missing_books.union(missing_snaps))}.\n"
-                                "Manually run with \"check:create_snapshots -f\" to skip this step when ready.")
-        
+        if missing_books or missing_snaps:
+            return TaskFailed("Sender snapshots/bookmarks don't match expected.\n"
+                            f"The following snapshots/bookmarks were missing: {', '.join(missing_books.union(missing_snaps))}.\n"
+                            "Manually run with \"check:create_snapshots -f\" to skip this step when ready.")
+
+    def create_success():
         snapshots = " ".join(CONFIG.inc_targets)
-
         return {
             "snapshots": snapshots,
         }
-    
-    def prepare_precond(force_success, snaps_raw):
-        if force_success:
-            print("Assuming receiver was prepared manually")
-        else:
-            candidates = set(CONFIG.dst_datasets)
-            all_snaps = set(snaps_raw.split("\n"))
 
-            if len(candidates - all_snaps) != 0:
-                return TaskFailed("Receiver snapshots don't match expected.\n"
-                                f"The following snapshots were missing: {', '.join(candidates - all_snaps)}.\n"
-                                "Manually run with \"check:prepare_receiver -f\" to skip this step when ready.")
-            
-    def send_precond(force_success, from_raw, to_raw):
+    def prepare_precond(snaps_raw):
+        candidates = set(CONFIG.dst_datasets)
+        all_snaps = set(snaps_raw.split("\n"))
+
+        if len(candidates - all_snaps) != 0:
+            return TaskFailed("Receiver snapshots don't match expected.\n"
+                            f"The following snapshots were missing: {', '.join(candidates - all_snaps)}.\n"
+                            "Manually run with \"check:prepare_receiver -f\" to skip this step when ready.")
+
+    def send_precond(from_raw, to_raw):
         from_ = set(from_raw.split("\n"))
         from_.remove("")
 
         to = set(to_raw.split("\n"))
         to.remove("")
 
-        if force_success:
-            print("Assuming snapshots are prepared manually")
-        else:
-            missing_from_books_src = set(CONFIG.bookmark_inc_sources) - from_
-            missing_from_snaps_src = set(CONFIG.snap_inc_sources)  - from_
-            missing_from_snaps_dst = set(CONFIG.inc_targets)  - from_
-            missing_to_snaps = set(CONFIG.dst_datasets_prev) - to
+        missing_from_books_src = set(CONFIG.bookmark_inc_sources) - from_
+        missing_from_snaps_src = set(CONFIG.snap_inc_sources)  - from_
+        missing_from_snaps_dst = set(CONFIG.inc_targets)  - from_
+        missing_to_snaps = set(CONFIG.dst_datasets_prev) - to
 
-            missing = missing_from_books_src | missing_from_snaps_src | \
-                missing_from_snaps_dst | missing_to_snaps
-            if missing:
-                    return TaskFailed("Sender/Receiver snapshots/bookmarks don't match expected.\n"
-                                    f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
-                                    "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
+        missing = missing_from_books_src | missing_from_snaps_src | \
+            missing_from_snaps_dst | missing_to_snaps
+        if missing:
+                return TaskFailed("Sender/Receiver snapshots/bookmarks don't match expected.\n"
+                                f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
+                                "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
 
+    def send_success():
         assert len([*CONFIG.all_datasets]) == len([*CONFIG.inc_sources])
         assert len([*CONFIG.inc_sources]) == len([*CONFIG.inc_targets])
         assert len([*CONFIG.inc_targets]) == len([*CONFIG.dst_datasets])
@@ -217,12 +223,13 @@ def task_check():
             vals = [inc_sources[i], inc_targets[i], dst_datasets[i],
                     CONFIG.is_bookmark_safe(ds)]
             send_args[title] = dict(zip(keys, vals))
-            
+
         return send_args
 
     yield {
         "name": "create_snapshots",
-        "actions": [create_precond],
+        "actions": [check_func(create_precond, create_success,
+                               "Assuming sender was prepared manually")],
         "getargs": {
             "snapbooks_raw": ("_zfs_list:pre_create", "snapbooks_raw")
         },
@@ -231,7 +238,8 @@ def task_check():
 
     yield {
         "name": "prepare_receiver",
-        "actions": [prepare_precond],
+        "actions": [check_func(prepare_precond, lambda: None,
+                               "Assuming receiver was prepared manually")],
         "getargs": {
             "snaps_raw": ("_zfs_list:pre_prepare", "snaps_raw")
         },
@@ -240,7 +248,8 @@ def task_check():
 
     yield {
         "name": "send_snapshots",
-        "actions": [send_precond],
+        "actions": [check_func(send_precond, send_success,
+                               "Assuming snapshots are prepared manually")],
         "getargs": {
             "from_raw": ("_zfs_list:pre_send_from", "from_raw"),
             "to_raw": ("_zfs_list:pre_send_to", "to_raw"),
@@ -353,8 +362,7 @@ def task_send_snapshots():
     # seems to fail with "cannot receive: failed to read from stream" if
     # the snapshot pipe@from-raidz exists already. Don't bother complicating
     # the commands just for that.
-    for key, bookmark_safe in  zip(CONFIG.all_datasets,
-                                   map(lambda ds: CONFIG.is_bookmark_safe(ds), CONFIG.all_datasets)):
+    for key in CONFIG.all_datasets:
         @maybe_echo_or_force
         def mk_send(send_info):
             send_src = send_info["send_src"]
@@ -379,7 +387,7 @@ def task_send_snapshots():
                 "prepare_receiver"
             ],
             "meta": {
-                "intr": not bookmark_safe
+                "intr": not CONFIG.is_bookmark_safe(key)
             },
             **deepcopy(TASK_DICT_COMMON),
         }
