@@ -198,8 +198,8 @@ def task_check():
                                     f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
                                     "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
 
-        assert len([*chain(CONFIG.bookmark_inc_sources, CONFIG.snap_inc_sources)]) == len(CONFIG.inc_targets)
-        assert len(CONFIG.inc_targets) == len(CONFIG.dst_datasets_prev)
+        assert len([*chain(CONFIG.bookmark_inc_sources, CONFIG.snap_inc_sources)]) == len([*CONFIG.inc_targets])
+        assert len([*CONFIG.inc_targets]) == len([*CONFIG.dst_datasets_prev])
         send_args = dict()
         for title, from_src, from_dst, to_src, bookmark in zip(
                                                CONFIG.all_datasets,
@@ -286,8 +286,8 @@ def task_init_dataset():
             {
                 "name": "snapshot",
                 "short": "s",
-                "type": bool,
-                "default": False,
+                "type": str,
+                "default": "",
                 "help": "preserve snapshot after send (default is to bookmark)"
             }
         ],
@@ -470,19 +470,19 @@ class ZFSConfig(Config):
 
     @property
     def bookmark_inc_sources(self):
-        return map(lambda ds: f"{ds}#{self.from_}-prev", self.bookmark_safe_datasets)
+        return map(lambda ds: f"{ds}#{self.suffix}-prev", self.bookmark_safe_datasets)
 
     @property
     def bookmark_inc_targets(self):
-        return map(lambda ds: f"{ds}@{self.from_}", self.bookmark_safe_datasets)
+        return map(lambda ds: f"{ds}@{self.suffix}", self.bookmark_safe_datasets)
 
     @property
     def snap_inc_sources(self):
-        return map(lambda ds: f"{ds}@{self.from_}-prev", self.snap_req_datasets)
+        return map(lambda ds: f"{ds}@{self.suffix}-prev", self.snap_req_datasets)
     
     @property
     def snap_inc_targets(self):
-        return map(lambda ds: f"{ds}@{self.from_}", self.snap_req_datasets)
+        return map(lambda ds: f"{ds}@{self.suffix}", self.snap_req_datasets)
     
     @property
     def inc_sources(self):
@@ -546,13 +546,17 @@ class CrZSnapTaskLoader(ModuleTaskLoader):
         self.zfs_config.update(zfs_config)
 
 
+# https://github.com/pydoit/doit/issues/469
+DOIT_CONFIG = {
+    "default_tasks": [],
+}
+
 def main():
     sys.exit(DoitMain(CrZSnapTaskLoader(globals(), CONFIG), extra_config={
         "GLOBAL": {
             "dep_file": str(Path(user_state_dir("crzsnap")) / ".crzsnap.doit.db"),
             "action_string_formatting": "new",
             "verbosity": 2,
-            "default_tasks": [],
             "forget_all": True
         }
     }).run(sys.argv[1:]))
