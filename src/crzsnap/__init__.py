@@ -48,14 +48,12 @@ def show_cmd(task):
 
         preserved = " (with intermediate snapshots)" if not bookmark else ""
         return f"Send {inc_src}..{inc_trg} -> {dst_trg}{preserved}"
-    elif task.name.startswith("make_bookmarks"):
-        book = task.meta["book"]
-        snap = task.meta["snap"]
-        return f"Replace {snap} -> {book}"
-    elif task.name.startswith("move_snapshots"):
-        prev = task.meta["prev"]
-        snap = task.meta["snap"]
-        return f"Replace {snap} -> {prev}"
+    elif task.name.startswith("rotate"):
+        dataset = task.name.split(":")[1]
+        inc_src = CONFIG.inc_src(dataset)
+        inc_trg = CONFIG.inc_trg(dataset)
+
+        return f"Replace {inc_trg} -> {inc_src}"
     elif task.name.startswith("check"):
         return f"Checking preconditions for {task.name.split(':')[1]}"
     elif task.name.startswith("init"):
@@ -130,6 +128,12 @@ def task__zfs_list():
         "verbosity": 0,
     }
 
+    yield {
+        "name": "pre_rotate",
+        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {CONFIG.from_}", save_out="snapbooks_raw")],
+        "verbosity": 0,
+    }
+
 
 def task_check():
     def check_func(check_phase, success_phase, force_msg):
@@ -158,11 +162,8 @@ def task_check():
         snapbooks = set(snapbooks_raw.split("\n"))
         snapbooks.remove("")
 
-        books_required = set(CONFIG.bookmark_inc_sources())
-        snapshots_required = set(CONFIG.snap_inc_sources())
-
-        missing_books = books_required - snapbooks
-        missing_snaps = snapshots_required - snapbooks
+        missing_books = set(CONFIG.bookmark_inc_sources()) - snapbooks
+        missing_snaps = set(CONFIG.snap_inc_sources()) - snapbooks
 
         if missing_books or missing_snaps:
             return TaskFailed("Sender snapshots/bookmarks don't match expected.\n"
@@ -208,6 +209,19 @@ def task_check():
                                 f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
                                 "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
 
+    def rotate_precond(snapbooks_raw):
+        snapbooks = set(snapbooks_raw.split("\n"))
+        snapbooks.remove("")
+
+        missing_inc_sources = set(CONFIG.inc_sources()) - snapbooks
+        missing_inc_targets = set(CONFIG.inc_targets()) - snapbooks
+
+        if missing_inc_sources or missing_inc_targets:
+            return TaskFailed("Sender snapshots/bookmarks don't match expected.\n"
+                            f"The following snapshots/bookmarks were missing: {', '.join(missing_inc_sources.union(missing_inc_targets))}.\n"
+                            "Manually run with \"check:rotate_sender -f\" to skip this step when ready.")
+
+
     yield {
         "name": "create_snapshots",
         "actions": [check_func(create_precond, create_success,
@@ -239,11 +253,15 @@ def task_check():
         **deepcopy(task_dict_common)
     }
 
-    # yield {
-    #     "name": "pre_prepare",
-    #     "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}", save_out="snaps_raw")],
-    #     "verbosity": 0,
-    # }
+    yield {
+        "name": "rotate_sender",
+        "actions": [check_func(rotate_precond, lambda: None,
+                               "Assuming sender was prepared manually for rotation")],
+        "getargs": {
+            "snapbooks_raw": ("_zfs_list:pre_rotate", "snapbooks_raw")
+        },
+        **deepcopy(task_dict_common)
+    }
 
 def task_init_dataset():
     """Initialize a dataset on sender and receiver for future incremental backups.
@@ -287,8 +305,8 @@ def task_init_dataset():
             {
                 "name": "snapshot",
                 "short": "s",
-                "type": str,
-                "default": "",
+                "type": bool,
+                "default": False,
                 "help": "preserve snapshot after send (default is to bookmark)"
             }
         ],
@@ -385,42 +403,53 @@ def task_send_snapshots():
 # fs changes prevents accidentally overwriting successfully sent snapshots
 # and the previously-send one. I consider this preferable to automatic retrying.
 def task_rotate_sender():
-    pass
+    @maybe_echo_or_force
+    def mk_destroy(snapbook):
+        return f"sudo zfs destroy {snapbook}"
 
-def task_make_bookmarks():
-    for b, bs in zip(CONFIG.bookmark_inc_sources(), CONFIG.bookmark_inc_targets()):
-        yield {
-            "name": b.replace("/", "-"),
-            "actions": [
-                CmdAction(f"sudo zfs destroy {b} && sudo zfs bookmark {bs} {b} && sudo zfs destroy {bs}")
-            ],
-            "title": show_cmd,
-            "uptodate": [
-                run_once
-            ],
-            "meta": {
-                "book": b,
-                "snap": bs
+    @maybe_echo_or_force
+    def mk_rename(src, dst):
+        return f"sudo zfs rename {src} {dst}"
+    
+    @maybe_echo_or_force
+    def mk_bookmark(snapbook, newbook):
+        return f"sudo zfs bookmark {snapbook} {newbook}"
+
+    for key in CONFIG.all_datasets():
+        send_src = CONFIG.inc_src(key)
+        send_trg = CONFIG.inc_trg(key)
+
+        if CONFIG.is_bookmark_safe(key):
+            yield {
+                "name": key,
+                "actions": [
+                    CmdAction(partial(mk_destroy, snapbook=send_src)),
+                    CmdAction(partial(mk_bookmark, snapbook=send_trg, newbook=send_src)),
+                    CmdAction(partial(mk_destroy, snapbook=send_trg)),
+                ],
+                "setup": [
+                    "check:rotate_sender"
+                ],
+                "task_dep": [
+                    "send_snapshots"
+                ],
+                **deepcopy(TASK_DICT_COMMON),
             }
-        }
-
-
-def task_move_snapshots():
-    for p, s in zip(CONFIG.snap_inc_sources(), CONFIG.snap_inc_targets()):
-        yield {
-            "name": p.replace("/", "-"),
-            "actions": [
-                CmdAction(f"sudo zfs destroy {p} && sudo zfs rename {s} {p}")
-            ],
-            "title": show_cmd,
-            "uptodate": [
-                run_once
-            ],
-            "meta": {
-                "prev": p,
-                "snap": s
+        else:
+            yield {
+                "name": key,
+                "actions": [
+                    CmdAction(partial(mk_destroy, snapbook=send_src)),
+                    CmdAction(partial(mk_rename, src=send_trg, dst=send_src)),
+                ],
+                "setup": [
+                    "check:rotate_sender"
+                ],
+                "task_dep": [
+                    "send_snapshots"
+                ],
+                **deepcopy(TASK_DICT_COMMON),
             }
-        }
 
 
 def task_all():        
@@ -429,7 +458,8 @@ def task_all():
         "task_dep": [
             "create_snapshots",
             "prepare_receiver",
-            "send_snapshots"
+            "send_snapshots",
+            "rotate_sender"
         ],
         "uptodate": [
             run_once
