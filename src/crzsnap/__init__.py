@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 
+"""crzsnap- CR1901's ZFS Snapshot Engine."""
+
 import sys
 import json
-import doit
 
 from appdirs import user_state_dir, user_config_dir
 from configclass import Config
-appname = "crzsnap"
 
-from doit import task_params, get_var
+from doit import get_var
 from doit.exceptions import TaskFailed
-from doit.tools import Interactive, config_changed, CmdAction, result_dep, run_once
+from doit.tools import CmdAction, run_once
 from doit.cmd_base import ModuleTaskLoader
 from doit.doit_cmd import DoitMain
 
 from copy import deepcopy
 from functools import partial
-from itertools import chain, repeat
-from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 
+appname = "crzsnap"
 
 FORCE_ARG = [
     {
@@ -33,9 +33,10 @@ FORCE_ARG = [
 
 
 def show_cmd(task):
-    if task.name == "create_snapshots":
+    """Global title creator for tasks."""
+    if task.name == "create_sender_snapshots":
         return "Create snapshots to send"
-    elif task.name == "prepare_receiver":
+    elif task.name == "rotate_receiver":
         return f"Prepare {CONFIG.to} to receive datasets"
     elif task.name.startswith("send_snapshots"):
         # We have to reconstruct send/recv information since we can't pass
@@ -63,6 +64,7 @@ def show_cmd(task):
 
 
 def maybe_echo_or_force(cmd):
+    """Possibly insert echo prefix to command action or skip running the command."""  # noqa: E501
     def inner(*args, force_success, **kwargs):
         echo = bool(get_var("echo", False))
         if force_success and not echo:
@@ -76,6 +78,7 @@ def maybe_echo_or_force(cmd):
 
 
 def maybe_echo(cmd):
+    """Possibly insert echo prefix to command action.""" 
     def inner(*args, **kwargs):
         return maybe_echo_or_force(cmd)(*args, force_success=False, **kwargs)
 
@@ -83,6 +86,11 @@ def maybe_echo(cmd):
 
 
 def run_once_unless_echo_invoked(task, values):
+    """Augmented run_once uptodate check.
+     
+    Check if echo argument was supplied, if yes, unconditionally mark the
+    task as not up-to-date. Otherwise, fall back to run_once implementation.
+    """
     # If we provided the global echo, then run tasks, as it'll in effect
     # be a dry-run. Otherwise, defer to the run_once implementation.
     echo = get_var("echo", None)
@@ -104,38 +112,49 @@ TASK_DICT_COMMON = {
 # We run zfs list several times- sometimes the same command!- to reduce the
 # probability of TOCTOU problems.
 def task__zfs_list():
+    """Run 'zfs list -H' several times during different phases of snapshot xfer.
+    
+    Each run returns the raw output of `zfs list -H`. These are meant to be
+    used as setup tasks to the check tasks.
+    """  # noqa: E501
     yield {
         "name": "pre_create",
-        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {CONFIG.from_}", save_out="snapbooks_raw")],
+        "actions": [CmdAction("zfs list -H -rtsnap,bookmark -oname "
+                              f"{CONFIG.from_}", save_out="snapbooks_raw")],
         "verbosity": 0,
     }
 
     yield {
         "name": "pre_prepare",
-        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}", save_out="snaps_raw")],
+        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}",
+                               save_out="snaps_raw")],
         "verbosity": 0,
     }
 
     yield {
         "name": "pre_send_from",
-        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {CONFIG.from_}", save_out="from_raw")],
+        "actions": [CmdAction("zfs list -H -rtsnap,bookmark -oname "
+                              f"{CONFIG.from_}", save_out="from_raw")],
         "verbosity": 0,
     }
 
     yield {
         "name": "pre_send_to",
-        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}", save_out="to_raw")],
+        "actions": [CmdAction(f"zfs list -H -rtsnap -oname {CONFIG.to}",
+                               save_out="to_raw")],
         "verbosity": 0,
     }
 
     yield {
         "name": "pre_rotate",
-        "actions": [CmdAction(f"zfs list -H -rtsnap,bookmark -oname {CONFIG.from_}", save_out="snapbooks_raw")],
+        "actions": [CmdAction("zfs list -H -rtsnap,bookmark -oname "
+                              f"{CONFIG.from_}", save_out="snapbooks_raw")],
         "verbosity": 0,
     }
 
 
 def task_check():
+    """Check pool and dataset consitency before running."""
     def check_func(check_phase, success_phase, force_msg):
         def inner(*args, force_success, **kwargs):
             if force_success:
@@ -166,9 +185,12 @@ def task_check():
         missing_snaps = set(CONFIG.snap_inc_sources()) - snapbooks
 
         if missing_books or missing_snaps:
-            return TaskFailed("Sender snapshots/bookmarks don't match expected.\n"
-                            f"The following snapshots/bookmarks were missing: {', '.join(missing_books.union(missing_snaps))}.\n"
-                            "Manually run with \"check:create_snapshots -f\" to skip this step when ready.")
+            msg = "Sender snapshots/bookmarks don't match expected.\n" \
+                  "The following snapshots/bookmarks were missing: " \
+                  f"{', '.join(missing_books.union(missing_snaps))}.\n" \
+                  "Manually run with \"check:create_sender_snapshots -f\" " \
+                  "to skip this step when ready."
+            return TaskFailed(msg)
 
     # Calculate w/ getargs b/c it's convenient.
     def create_success():
@@ -182,9 +204,12 @@ def task_check():
         all_snaps = set(snaps_raw.split("\n"))
 
         if len(candidates - all_snaps) != 0:
-            return TaskFailed("Receiver snapshots don't match expected.\n"
-                            f"The following snapshots were missing: {', '.join(candidates - all_snaps)}.\n"
-                            "Manually run with \"check:prepare_receiver -f\" to skip this step when ready.")
+            msg = "Receiver snapshots don't match expected.\n" \
+                  "The following snapshots were missing: " \
+                  f"{', '.join(candidates - all_snaps)}.\n" \
+                  "Manually run with \"check:rotate_receiver -f\" to skip " \
+                  "this step when ready."
+            return TaskFailed(msg)
 
     def send_precond(from_raw, to_raw):
         from_ = set(from_raw.split("\n"))
@@ -205,9 +230,12 @@ def task_check():
         missing = missing_from_books_src | missing_from_snaps_src | \
             missing_from_snaps_dst | missing_to_snaps
         if missing:
-                return TaskFailed("Sender/Receiver snapshots/bookmarks don't match expected.\n"
-                                f"The following snapshots/bookmarks were missing: {', '.join(missing)}.\n"
-                                "Manually run with \"check:send_snapshots -f\" to skip this step when ready.")
+            msg = "Sender/Receiver snapshots/bookmarks don't match expected.\n" \
+                  "The following snapshots/bookmarks were missing: " \
+                  f"{', '.join(missing)}.\n" \
+                  "Manually run with \"check:send_snapshots -f\" to skip " \
+                  "this step when ready."  # noqa: E501
+            return TaskFailed(msg)
 
     def rotate_precond(snapbooks_raw):
         snapbooks = set(snapbooks_raw.split("\n"))
@@ -217,28 +245,33 @@ def task_check():
         missing_inc_targets = set(CONFIG.inc_targets()) - snapbooks
 
         if missing_inc_sources or missing_inc_targets:
-            return TaskFailed("Sender snapshots/bookmarks don't match expected.\n"
-                            f"The following snapshots/bookmarks were missing: {', '.join(missing_inc_sources.union(missing_inc_targets))}.\n"
-                            "Manually run with \"check:rotate_sender -f\" to skip this step when ready.")
+            msg = "Sender snapshots/bookmarks don't match expected.\n" \
+                  "The following snapshots/bookmarks were missing: " \
+                  f"{', '.join(missing_inc_sources.union(missing_inc_targets))}.\n" \
+                  "Manually run with \"check:rotate_sender -f\" to skip this " \
+                  "step when ready."  # noqa: E501
+            return TaskFailed(msg)
 
 
     yield {
-        "name": "create_snapshots",
+        "name": "create_sender_snapshots",
         "actions": [check_func(create_precond, create_success,
                                "Assuming sender was prepared manually")],
         "getargs": {
             "snapbooks_raw": ("_zfs_list:pre_create", "snapbooks_raw")
         },
+        "doc": "Check that incremental sources are available.",
         **deepcopy(task_dict_common)
     }
 
     yield {
-        "name": "prepare_receiver",
+        "name": "rotate_receiver",
         "actions": [check_func(prepare_precond, lambda: None,
                                "Assuming receiver was prepared manually")],
         "getargs": {
             "snaps_raw": ("_zfs_list:pre_prepare", "snaps_raw")
         },
+        "doc": "Check that previous receiver incremental sources are available.",  # noqa: E501
         **deepcopy(task_dict_common)
     }
 
@@ -250,41 +283,47 @@ def task_check():
             "from_raw": ("_zfs_list:pre_send_from", "from_raw"),
             "to_raw": ("_zfs_list:pre_send_to", "to_raw"),
         },
+        "doc": "Check that sender/receiver incremental sources/targets are available.",  # noqa: E501
         **deepcopy(task_dict_common)
     }
 
     yield {
         "name": "rotate_sender",
         "actions": [check_func(rotate_precond, lambda: None,
-                               "Assuming sender was prepared manually for rotation")],
+                               "Assuming sender was prepared manually for rotation")],  # noqa: E501
         "getargs": {
             "snapbooks_raw": ("_zfs_list:pre_rotate", "snapbooks_raw")
         },
+        "doc": "Check that sender incremental sources and targets are available.",  # noqa: E501
         **deepcopy(task_dict_common)
     }
 
-def task_init_dataset():
-    """Initialize a dataset on sender and receiver for future incremental backups.
-       
-       Unlike other commands, this command is potentially destructive, and does
-       not perform checks against the config file (other than grabbing the
-       snapshot suffix and source/dest pool names). Thus, it can destroy existing
-       snapshots/files on receiver, and add datasets not in the config file."""
 
+def task_init_dataset():
+    """Initialize a dataset on sender and receiver for future incremental backups."""  # noqa: E501
+
+    # Unlike other commands, this command is potentially destructive, and does
+    # not perform checks against the config file (other than grabbing the
+    # snapshot suffix and source/dest pool names). Thus, it can destroy
+    # existing snapshots/files on receiver, and add datasets not in the config
+    # file.
     @maybe_echo
     def mk_create(pos, snapshot):
         return f"sudo zfs snap {pos[0]}@{CONFIG.suffix}"
 
     @maybe_echo
     def mk_send(pos, snapshot):
-        return f"sudo zfs send -pcL {pos[0]}@{CONFIG.suffix} | pv -f | sudo zfs recv -F {pos[0].replace(CONFIG.from_, CONFIG.to, 1)}"
+        return f"sudo zfs send -pcL {pos[0]}@{CONFIG.suffix} | pv -f | " \
+               f"sudo zfs recv -F {pos[0].replace(CONFIG.from_, CONFIG.to, 1)}"
 
     @maybe_echo    
     def mk_rename(pos, snapshot):
         if snapshot:
-            return f"sudo zfs rename {pos[0]}@{CONFIG.suffix} {pos[0]}@{CONFIG.suffix}-prev"
+            return f"sudo zfs rename {pos[0]}@{CONFIG.suffix} " \
+                   f"{pos[0]}@{CONFIG.suffix}-prev"
         else:
-            return f"sudo zfs bookmark {pos[0]}@{CONFIG.suffix} {pos[0]}#{CONFIG.suffix}-prev"
+            return f"sudo zfs bookmark {pos[0]}@{CONFIG.suffix} " \
+                   f"{pos[0]}#{CONFIG.suffix}-prev"
 
     @maybe_echo
     def mk_maybe_destroy(pos, snapshot):
@@ -314,7 +353,8 @@ def task_init_dataset():
     }
     
 
-def task_create_snapshots():
+def task_create_sender_snapshots():
+    """Create new incremental targets on sender."""
     @maybe_echo_or_force
     def mk_cmd(snapshots):
         # Will fail if snapshots already exist 
@@ -325,7 +365,7 @@ def task_create_snapshots():
             CmdAction(mk_cmd)
         ],
         "getargs": {
-            "snapshots": ("check:create_snapshots", "snapshots"),
+            "snapshots": ("check:create_sender_snapshots", "snapshots"),
         },
         # If we don't do deepcopy, then e.g. result_deps added by doit
         # propagate to other tasks b/c of sharing.
@@ -333,14 +373,16 @@ def task_create_snapshots():
     }
 
 
-def task_prepare_receiver():
+def task_rotate_receiver():
+    """Rotate receiver's previous incremental targets -> new incremental sources."""  # noqa: E501
     @maybe_echo_or_force
     def mk_destroy():
         return f"sudo zfs destroy -r {CONFIG.to}@{CONFIG.suffix}-prev"
 
     @maybe_echo_or_force
     def mk_rename():
-        return f"sudo zfs rename -r {CONFIG.to}@{CONFIG.suffix} {CONFIG.to}@{CONFIG.suffix}-prev"
+        return f"sudo zfs rename -r {CONFIG.to}@{CONFIG.suffix} " \
+               f"{CONFIG.to}@{CONFIG.suffix}-prev"
 
     return {
         "actions": [
@@ -348,18 +390,19 @@ def task_prepare_receiver():
             CmdAction(mk_rename),
         ],
         "setup": [
-            "check:prepare_receiver"
+            "check:rotate_receiver"
         ],
         "task_dep": [
-            "create_snapshots"
+            "create_sender_snapshots"
         ],
         **deepcopy(TASK_DICT_COMMON)
     }
 
 
 def task_send_snapshots():
+    """Incrementally send snapshots from sender to receiver."""
     # These should all succeed, except maybe the root dataset one. E.g.
-    # sudo zfs send -pcLi tank#from-raidz-prev | pv | sudo zfs recv -F pipe@from-raidz
+    # sudo zfs send -pcLi tank#from-raidz-prev | pv | sudo zfs recv -F pipe@from-raidz  # noqa: E501
     # seems to fail with "cannot receive: failed to read from stream" if
     # the snapshot pipe@from-raidz exists already. Don't bother complicating
     # the commands just for that.
@@ -371,8 +414,12 @@ def task_send_snapshots():
             recv_trg = CONFIG.dst_trg(key)
             flags = "-pcLi" if CONFIG.is_bookmark_safe(key) else "-pcLRI"
             
-            return f"sudo zfs send {flags} {send_src} {send_trg} | pv -f | sudo zfs recv -F {recv_trg}"
+            return f"sudo zfs send {flags} {send_src} {send_trg} | pv -f | " \
+                   f"sudo zfs recv -F {recv_trg}"
 
+        send_src = CONFIG.inc_src(key)
+        send_trg = CONFIG.inc_trg(key)
+        recv_trg = CONFIG.dst_trg(key)
         yield {
             "name": key,
             "actions": [
@@ -383,26 +430,30 @@ def task_send_snapshots():
                 "check:send_snapshots"
             ],
             "task_dep": [
-                "prepare_receiver"
+                "rotate_receiver"
             ],
+            "doc": f"Send {send_src}..{send_trg} -> {recv_trg}",
             **deepcopy(TASK_DICT_COMMON),
         }
 
 # This script assumes run from start to finish. Once a previous step has
 # completed, the script will not know about filesystem modifications, and
 # single previous steps that have completed cannot be run again. Instead, _all_
-# tasks can be reset via "forget", and tasks that do not need to rerun can be forced to complete
+# tasks can be reset via "forget", and tasks that do not need to rerun can be
+# forced to complete
 # successfully without doing anything by passing the "-f" option to tasks.
 # echo=1 recommended- it is a noop
 # forget resets the script to the beginning to attempt another incremental
 # backup.
-# Run init_dataset _before_ first run of script or after a successful completion
-# and the script has been reset.
+# Run init_dataset _before_ first run of script or after a successful
+# completion and the script has been reset.
 # Otherwise, manual modifications to your source and dest pools may be needed
 # if init_dataset is run in the middle of the interrupted script. Not tracking
 # fs changes prevents accidentally overwriting successfully sent snapshots
-# and the previously-send one. I consider this preferable to automatic retrying.
+# and the previously-send one. I consider this preferable to automatic
+# retrying.
 def task_rotate_sender():
+    """Rotate senders's previous incremental targets -> new incremental sources."""  # noqa: E501
     @maybe_echo_or_force
     def mk_destroy(snapbook):
         return f"sudo zfs destroy {snapbook}"
@@ -424,7 +475,8 @@ def task_rotate_sender():
                 "name": key,
                 "actions": [
                     CmdAction(partial(mk_destroy, snapbook=send_src)),
-                    CmdAction(partial(mk_bookmark, snapbook=send_trg, newbook=send_src)),
+                    CmdAction(partial(mk_bookmark, snapbook=send_trg,
+                                      newbook=send_src)),
                     CmdAction(partial(mk_destroy, snapbook=send_trg)),
                 ],
                 "setup": [
@@ -433,6 +485,7 @@ def task_rotate_sender():
                 "task_dep": [
                     "send_snapshots"
                 ],
+                "doc": f"Rotate {send_trg} -> {send_src}",
                 **deepcopy(TASK_DICT_COMMON),
             }
         else:
@@ -448,16 +501,18 @@ def task_rotate_sender():
                 "task_dep": [
                     "send_snapshots"
                 ],
+                "doc": f"Rotate {send_trg} -> {send_src}",
                 **deepcopy(TASK_DICT_COMMON),
             }
 
 
-def task_all():        
+def task_all():
+    """Run entire snapshot rotations and xfers in one go."""
     return {
         "actions": [],
         "task_dep": [
-            "create_snapshots",
-            "prepare_receiver",
+            "create_sender_snapshots",
+            "rotate_receiver",
             "send_snapshots",
             "rotate_sender"
         ],
@@ -468,77 +523,132 @@ def task_all():
 
 
 class ZFSConfig(Config):
+    """`Config` helper class to calculate zfs datasets and snapshots.
+    
+    This is intended to be a singleton shared between all task loader functions
+    and classes in crzsnap. It should never be modified more than once.
+    """
+
+    # TODO: Enforce set-once behavior somehow...
+
     # Basic getters- plays nicer with f-strings.
     @property
     def to(self):
+        """CONFIG["to"] getter."""
         return self["to"]
     
     @property
     def from_(self):
+        """CONFIG["from"] getter."""
         return self["from"]
     
     @property
     def suffix(self):
+        """CONFIG["suffix"] getter."""
         return self["suffix"]
 
     @property
     def bookmark_safe_datasets(self):
+        """CONFIG["bookmarks"] getter."""
         return self["bookmark"]
 
     @property
     def snap_req_datasets(self):
+        """CONFIG["snapshots"] getter."""
         return self["snapshot"]
 
     def all_datasets(self):
+        """Return iterable of all datasets in CONFIG."""
         return chain(self.bookmark_safe_datasets, self.snap_req_datasets)
 
     def inc_src(self, ds):
+        """Return iterable of all the sender's incremental sources in CONFIG.
+        
+        Given a dataset "ds" in pools "tank" and "pipe", an incremental source
+        is the "src" snapshot (@) or bookmark (#) in:
+
+        `zfs send -i tank/ds{#,@}src tank/ds@dst | zfs recv pipe/ds@dst`.
+        """
         splitter = "#" if self.is_bookmark_safe(ds) else "@"
         return f"{ds}{splitter}{self.suffix}-prev" 
     
     def inc_trg(self, ds):
+        """Return iterable of all the sender's incremental targets in CONFIG.
+        
+        Given a dataset "ds" in pools "tank" and "pipe", an incremental target
+        is the "dst" snapshot of tank in:
+
+        `zfs send -i tank/ds{#,@}src tank/ds@dst | zfs recv pipe/ds@dst`.
+        """
         return f"{ds}@{self.suffix}"
     
     def dst_trg(self, ds):
+        """Return iterable of all the receiver's incremental targets in CONFIG.
+        
+        Given a dataset "ds" in pools "tank" and "pipe", the receiver's
+        incremental target is the "dst" snapshot of pipe in:
+
+        `zfs send -i tank/ds{#,@}src tank/ds@dst | zfs recv pipe/ds@dst`.
+        """
         return f"{ds.replace(self.from_, self.to, 1)}@{self.suffix}"
 
     def dst_trg_prev(self, ds):
+        """Return iterable of all the receiver's incremental sources in CONFIG.
+        
+        Given a dataset "ds" in pools "tank" and "pipe", the receiver's
+        incremental target is the implied "src" snapshot of pipe in
+        `zfs send -i tank/ds{#,@}src tank/ds@dst | zfs recv pipe/ds@dst`.
+        """
         return f"{ds.replace(self.from_, self.to, 1)}@{CONFIG.suffix}-prev"
 
     def is_bookmark_safe(self, ds):
+        """Predicate which returns True if a dataset's incremental source is a bookmark."""  # noqa: E501
         return ds in self.bookmark_safe_datasets
 
     def bookmark_inc_sources(self):
+        """Return all sender's incremental sources which are bookmarks."""
         return map(self.inc_src, self.bookmark_safe_datasets)
 
     def bookmark_inc_targets(self):
+        """Return all sender's incremental targets whose sources are bookmarks."""  # noqa: E501
         return map(self.inc_trg, self.bookmark_safe_datasets)
 
     def snap_inc_sources(self):
+        """Return all sender's incremental sources which are snapshots."""
         return map(self.inc_src, self.snap_req_datasets)
 
     def snap_inc_targets(self):
+        """Return all sender's incremental targets whose sources are snapshots."""  # noqa: E501
         return map(self.inc_trg, self.snap_req_datasets)
 
     def inc_sources(self):
+        """Return all sender's incremental sources."""
         return map(self.inc_src, self.all_datasets())
 
     def inc_targets(self):
+        """Return all sender's incremental targets."""
         return map(self.inc_trg, self.all_datasets())
 
     def dst_datasets(self):
         # FIXME: make sure the string begins with self.from_ before
         # substituting.
+        """Return all receivers's incremental targets."""
         return map(self.dst_trg, self.all_datasets())
 
     def dst_datasets_prev(self):
         # FIXME: make sure the string begins with self.from_ before
         # substituting.
+        """Return all receivers's incremental sources.
+        
+        The receiver's incremental sources are not specified in an incremental
+        send and recv command pipeline; they are implied. However, they should
+        still be checked for existence.
+        """
         return map(self.dst_trg_prev, self.all_datasets())
 
 
-# The Config is injected into all task creator classes as an empty config.
-# Then the task loader populates each entry.
+# CONFIG Singleton. The task loader populates it from the file specified by
+# the --dataset-config argument to crzsnap (or a system-specific defaault).
 CONFIG = ZFSConfig({
     "from": "",
     "to": "",
@@ -562,16 +672,25 @@ opt_dataset_config = {
 
 
 class CrZSnapTaskLoader(ModuleTaskLoader):
-    cmd_options = (opt_dataset_config,)
-    """ModuleTaskLoader that takes an argument to change the config file
-    where datasets are loaded.
+    """ModuleTaskLoader that takes a config file config file argument.
+    
+    Parameters
+    ----------
+    * mod_dict: Module dictionary or `globals()`. Pass to `ModuleTaskLoader`
+      unaltered.
+    * zfs_config: Reference to a `ZFSConfig` global. To be populated by
+      `doit` loader initialization using the file provided by
+      `opt_dataset_config`.
     """
+
+    cmd_options = (opt_dataset_config,)
 
     def __init__(self, mod_dict, zfs_config):
         self.zfs_config = zfs_config
         super().__init__(mod_dict)
 
     def setup(self, opt_values):
+        """Populate config singleton with data from `dataset_config` argument."""  # noqa: E501
         with open(opt_values["dataset_config"]) as fp:
             zfs_config = json.load(fp)
 
@@ -584,9 +703,11 @@ DOIT_CONFIG = {
 }
 
 def main():
+    """Main entry point."""  # noqa: D401
     sys.exit(DoitMain(CrZSnapTaskLoader(globals(), CONFIG), extra_config={
         "GLOBAL": {
-            "dep_file": str(Path(user_state_dir("crzsnap")) / ".crzsnap.doit.db"),
+            "dep_file": str(Path(user_state_dir("crzsnap")) /
+                            ".crzsnap.doit.db"),
             "action_string_formatting": "new",
             "verbosity": 2,
             "forget_all": True

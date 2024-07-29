@@ -21,5 +21,19 @@ build-backend = "pdm.backend"
 [project.scripts]
 crzsnap = "crzsnap:main"
 
+[tool.ruff]
+src = [ "src", "tests" ]  # https://docs.astral.sh/ruff/faq/#how-does-ruff-determine-which-of-my-imports-are-first-party-third-party-etc
+line-length = 79  # flake8 compat
+# These will catch missing docstrings and other nits, which pydoclint doesn't.
+# Also, add stable-but-disabled E checks
+lint.extend-select = ["E4", "E5", "E7", "E9", "D"]
+lint.pydocstyle.convention = "numpy"
+lint.pycodestyle.max-line-length = 79  # flake8 compat
+
 [tool.pdm]
 distribution = true
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "ruff>=0.5.5",
+]
