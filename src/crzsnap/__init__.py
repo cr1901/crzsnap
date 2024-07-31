@@ -411,8 +411,14 @@ def task_send_snapshots():
         def mk_send(key=key):
             send_src = CONFIG.inc_src(key)
             send_trg = CONFIG.inc_trg(key)
-            recv_trg = CONFIG.dst_trg(key)
-            flags = "-pcLi" if CONFIG.is_bookmark_safe(key) else "-pcLRI"
+            if CONFIG.is_bookmark_safe(key):
+                recv_trg = CONFIG.dst_trg(key)
+                flags = "-pcLi"
+            else:
+                # If snapshot name is kept, we get cannot receive: cannot
+                # specify snapshot name for multi-snapshot stream
+                recv_trg = CONFIG.dst_trg(key).split("@")[0]
+                flags = "-pcLRI"
             
             return f"sudo zfs send {flags} {send_src} {send_trg} | pv -f | " \
                    f"sudo zfs recv -F {recv_trg}"
