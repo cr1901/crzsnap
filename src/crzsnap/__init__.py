@@ -2,10 +2,15 @@
 
 """crzsnap- CR1901's ZFS Snapshot Engine."""
 
+from contextlib import contextmanager
+from importlib.resources import files
+import os
+import pwd
 import sys
 import json
+import textwrap
 
-from platformdirs import user_state_dir, user_config_dir
+from platformdirs import user_runtime_dir, user_state_dir, user_config_dir
 from configclass import Config
 
 from doit import get_var
@@ -651,6 +656,94 @@ class ZFSConfig(Config):
         still be checked for existence.
         """
         return map(self.dst_trg_prev, self.all_datasets())
+
+
+# TODO: I want these scrub helpers to work with Illumos and *BSD, but can't
+# currently test.
+def _create_copy_zedlet_task(pools):
+    """Create a task which registers crzsnap's scrub helpers with ZED."""
+    event = "scrub_finish"  # Change to e.g. history_event for testing.
+    user = pwd.getpwuid(os.getuid()).pw_name
+    fn = f"/etc/zfs/zed.d/{event}-health-{user}.sh"
+
+    import jinja2
+    template_path = files("crzsnap").joinpath(f"{event}-template.jinja")
+
+    def mk_copy():
+        fifos = [Path(user_runtime_dir()) / f"zfs-health-{pool}.pipe"
+                 for pool in pools]
+        script = jinja2.Template(template_path.read_text()).render({
+            "filename": os.path.realpath(__file__),
+            "pools": pools,
+            "pipes": fifos,
+            "zip": zip
+        })
+
+        # TODO: I don't love this...
+        return textwrap.dedent(
+f"""sudo dd of={fn} <<EOF
+{script}
+EOF""")
+
+    return {
+        "basename": "_copy_zedlet",
+        "file_dep": [template_path],
+        "targets": [fn],
+        "actions": [CmdAction(mk_copy),
+                    CmdAction(f"sudo chmod 755 {fn}")]
+    }
+
+
+def create_scrub_tasks(pools):
+    """Create doit tasks for scrubbing and waiting for pools.
+
+    Arguments
+    ---------
+    pools: list(str)
+        Pools to be scrubbed under control of this script. Controls
+        the ``name`` argument of the ``scrub`` sub-tasks.
+     
+    Yields
+    ------
+    _copy_zedlet: dict
+        Copy a script to /etc/zfs/zed.d/ that ZED will execute
+        for each pool when a scrub is finished.
+    scrub: dict
+        Start ZFS scrubs and wait for them to finish. One scrub sub-task will
+        start for each argument provided to ``pools``. Each scrub sub-task
+        returns an argument saved under ``status``, which contains the output
+        of ``zpool status -x $pool``.
+    """
+    yield _create_copy_zedlet_task(pools)
+
+    @contextmanager
+    def fifo(pool):
+        fifo = Path(user_runtime_dir()) / f"zfs-health-{pool}.pipe"
+        os.mkfifo(fifo)
+        try:
+            yield fifo
+        finally:
+            os.unlink(fifo)
+
+    def wait(pool):
+        # Basically, once scrub has been invoked (which should happen in the
+        # first action), open a FIFO and wait for ZED to contact us that the
+        # scrub is done.
+        with fifo(pool) as fifo_name, open(fifo_name, "r") as fp:
+            fp.read()
+
+    for pool in pools:
+        yield {
+            "basename": "scrub",
+            "name": pool,
+            "uptodate": [False],
+            "actions": [
+                CmdAction(f"sudo zfs scrub {pool}"),
+                (wait, (), {"pool": pool}),
+                CmdAction(f"zpool status -x {pool}", save_out="status")
+            ],
+            "setup": ["_copy_zedlet"],
+        }
 
 
 # CONFIG Singleton. The task loader populates it from the file specified by
