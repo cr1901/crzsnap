@@ -5,7 +5,7 @@
 import sys
 import json
 
-from appdirs import user_state_dir, user_config_dir
+from platformdirs import user_state_dir, user_config_dir
 from configclass import Config
 
 from doit import get_var
@@ -252,7 +252,6 @@ def task_check():
                   "step when ready."  # noqa: E501
             return TaskFailed(msg)
 
-
     yield {
         "name": "create_sender_snapshots",
         "actions": [check_func(create_precond, create_success,
@@ -441,6 +440,7 @@ def task_send_snapshots():
             "doc": f"Send {send_src}..{send_trg} -> {recv_trg}",
             **deepcopy(TASK_DICT_COMMON),
         }
+
 
 # This script assumes run from start to finish. Once a previous step has
 # completed, the script will not know about filesystem modifications, and
@@ -707,6 +707,7 @@ class CrZSnapTaskLoader(ModuleTaskLoader):
 DOIT_CONFIG = {
     "default_tasks": [],
 }
+
 
 def main():
     """Main entry point."""  # noqa: D401
