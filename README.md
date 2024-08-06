@@ -9,6 +9,8 @@ set of disks to another using incremental `zfs send` and `zfs recv`.
 
 * Either install this script with `pip install .`, or copy/symlink `__init__.py`
   to/from your personal `bin` directory; either works!
+  * You also need [OpenZFS](https://github.com/openzfs/zfs) and [`pv`](http://www.ivarch.com/programs/pv.shtml).
+    On a Debian-based system: `sudo apt-get install zfsutils-linux pv`
 
 * Fill out a [JSON file](#json-config-file-format) under `~/.config/crzsnap/crzsnap.json`.
   All datasets in the `bookmark` and `snapshot` arrays should include the pool
