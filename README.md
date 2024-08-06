@@ -184,11 +184,12 @@ need to quickly revert to a pristine state. `cat-videos` is a recent addition,
 and recently populated with all your favorite feline goodness.
 
 You have successfully set up `backups` and `workdir` previously to be
-transferred from `tank` to `pipe` in the JSON config. Additionally, you have run
-`crzsnap all` successfully once (and _not_ `crzsnap forget` yet). Now you want
-to add the `cat-videos` dataset to be managed by `crzsnap`. You don't care
-about snapshotting `cat-videos`, so you add `cat-videos` to the `bookmarks`
-section of your JSON config.
+transferred from `tank` to `pipe` in the JSON config (i.e. you have run
+`crzsnap init_dataset backups` and `crzsnap init_dataset -s workdir` and both
+succeeded). Additionally, you have run `crzsnap all` successfully once (and
+_not_ `crzsnap forget` yet). Now you want to add the `cat-videos` dataset to be
+managed by `crzsnap`. You don't care about snapshotting `cat-videos`, so you
+add `cat-videos` to the `bookmarks` section of your JSON config.
 
 Assuming your snapshot suffix is `from-main`, right now your JSON config should
 match the config in the [JSON example section](#json-config-file-format). We'll
