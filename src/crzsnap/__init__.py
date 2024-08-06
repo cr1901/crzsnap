@@ -275,7 +275,7 @@ def task_check():
         "getargs": {
             "snaps_raw": ("_zfs_list:pre_prepare", "snaps_raw")
         },
-        "doc": "Check that previous receiver incremental sources are available.",  # noqa: E501
+        "doc": "Check that previous receiver targets are available.",  # noqa: E501
         **deepcopy(task_dict_common)
     }
 
@@ -287,7 +287,7 @@ def task_check():
             "from_raw": ("_zfs_list:pre_send_from", "from_raw"),
             "to_raw": ("_zfs_list:pre_send_to", "to_raw"),
         },
-        "doc": "Check that sender/receiver incremental sources/targets are available.",  # noqa: E501
+        "doc": "Check that sender incremental sources/targets and receiver's matched snapshots are available.",  # noqa: E501
         **deepcopy(task_dict_common)
     }
 
@@ -378,7 +378,7 @@ def task_create_sender_snapshots():
 
 
 def task_rotate_receiver():
-    """Rotate receiver's previous incremental targets -> new incremental sources."""  # noqa: E501
+    """Rotate receiver's previous targets -> new matched snapshots."""  # noqa: E501
     @maybe_echo_or_force
     def mk_destroy():
         return f"sudo zfs destroy -r {CONFIG.to}@{CONFIG.suffix}-prev"
@@ -594,22 +594,22 @@ class ZFSConfig(Config):
         return f"{ds}@{self.suffix}"
     
     def dst_trg(self, ds):
-        """Return iterable of all the receiver's incremental targets in CONFIG.
+        """Return iterable of all the receiver's targets in CONFIG.
         
         Given a dataset "ds" in pools "tank" and "pipe", the receiver's
-        incremental target is the "dst" snapshot of pipe in:
+        target is the "dst" snapshot of pipe in:
 
         `zfs send -i tank/ds{#,@}src tank/ds@dst | zfs recv pipe/ds@dst`.
         """
         return f"{ds.replace(self.from_, self.to, 1)}@{self.suffix}"
 
     def dst_trg_prev(self, ds):
-        """Return iterable of all the receiver's incremental sources in CONFIG.
+        """Return iterable of all the receiver's matched snapshots in CONFIG.
         
         Given a dataset "ds" in pools "tank" and "pipe", the receiver's
-        incremental target is the implied "src" snapshot of pipe in
-        `zfs send -i tank/ds{#,@}src tank/ds@dst | zfs recv pipe/ds@dst`.
-        """
+        matched snapshot (matched to the sender pool) is the implied "src"
+        snapshot of pipe in `zfs send -i tank/ds{#,@}src tank/ds@dst | zfs recv pipe/ds@dst`.
+        """ # noqa: E501
         return f"{ds.replace(self.from_, self.to, 1)}@{CONFIG.suffix}-prev"
 
     def is_bookmark_safe(self, ds):
@@ -643,17 +643,17 @@ class ZFSConfig(Config):
     def dst_datasets(self):
         # FIXME: make sure the string begins with self.from_ before
         # substituting.
-        """Return all receivers's incremental targets."""
+        """Return all receivers's targets."""
         return map(self.dst_trg, self.all_datasets())
 
     def dst_datasets_prev(self):
         # FIXME: make sure the string begins with self.from_ before
         # substituting.
-        """Return all receivers's incremental sources.
+        """Return all receivers's matched snapshots.
         
-        The receiver's incremental sources are not specified in an incremental
-        send and recv command pipeline; they are implied. However, they should
-        still be checked for existence.
+        The receiver's matched snapshots (matched to the sender) are not
+        specified in an incremental send and recv command pipeline; they are
+        implied. However, they should still be checked for existence.
         """
         return map(self.dst_trg_prev, self.all_datasets())
 
